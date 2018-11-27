@@ -1,51 +1,31 @@
 package main
 
 import (
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/base64"
 	"github.com/aws/aws-sdk-go/aws/session"
-	"github.com/sethvargo/go-password/password"
 	cidp "github.com/aws/aws-sdk-go/service/cognitoidentityprovider"
+	"github.com/sethvargo/go-password/password"
 	log "github.com/sirupsen/logrus"
 	"os"
-	"strings"
 	"regexp"
+	"strings"
 )
 
-//~ func createPool() (*cidp.IdentityPool, error){
-	
-	//~ var poolParams cid.CreateIdentityPoolInput
-	//~ poolParams.SetAllowUnauthenticatedIdentities(false);
-	
-	//~ intClientId := os.Getenv("CLIENT")
-	//~ intProviderName := os.Getenv("PROVIDER")
-	//~ intServerSideTokenCheck := true
-	
-	//~ provider := []*cid.Provider {
-		//~ &cid.Provider {
-			//~ ClientId: &intClientId,
-			//~ ProviderName: &intProviderName,
-			//~ ServerSideTokenCheck: &intServerSideTokenCheck,
-		//~ },
-	//~ }
-	
-	//~ poolParams.SetCognitoIdentityProviders(provider)
-	//~ poolParams.SetIdentityPoolName(os.Getenv("POOL"))
-	
-	//~ pool, err := svc.CreateIdentityPool(&poolParams)
-	//~ if err != nil {
-		//~ return nil, err
-	//~ }
-	
-	//~ return pool, err
-	
-//~ }
+var (
+	secret string = os.Getenv("HASH")
+	client string = os.Getenv("CLIENT")
+	pool   string = os.Getenv("POOL")
+)
 
 func pwMeetsCriteria(pw string) bool {
-	
+
 	findNum := regexp.MustCompile("[0-9]")
 	findSpecial := regexp.MustCompile("!|#|$|%|&|(|)|,|-|.|:|;|<|=|>|@|[|]|^|_|~")
-	
+
 	log.Debugf("pw: %s", pw)
-	
+
 	if pw == "" {
 		log.Debugf("pw_firstrun")
 		return false
@@ -62,100 +42,186 @@ func pwMeetsCriteria(pw string) bool {
 		log.Debugf("pw_nospecial")
 		return false
 	}
-	
+
 	log.Debugf("pw: %s", pw)
-	
+
 	return true
 }
 
 func genpw() string {
-	
+
 	log.Debugf("genpw_start")
-	
+
 	pw := ""
 	var err error = nil
 	pwlen := 12
-	
-	for ! pwMeetsCriteria(pw){
-		
+
+	for !pwMeetsCriteria(pw) {
+
 		pw, err = password.Generate(pwlen, pwlen/4, pwlen/4, false, false)
-		if err != nil  {
+		if err != nil {
 			panic(err)
 		}
-	
+
 	}
-	
+
 	log.Debugf("genpw_end")
-	
+
 	return pw
-	
+
 }
 
-func addUser(svc *cidp.CognitoIdentityProvider, email string, username string) (*cidp.AdminCreateUserOutput, error) {
-	
+func addUser(svc *cidp.CognitoIdentityProvider, email string, username string) (*cidp.AdminCreateUserOutput, string, error) {
+
 	log.Debugf("addUser_begin")
-	
+
 	var acui cidp.AdminCreateUserInput
-	
+
 	// DesiredDeliveryMediums
 	emailDelivery := "EMAIL"
-	deliveries := []*string { &emailDelivery }
+	deliveries := []*string{&emailDelivery}
 	acui.SetDesiredDeliveryMediums(deliveries)
-	
+
 	// TODO: Set MessageAction to "RESEND" for
 	// already existing users
-	
+	acui.SetMessageAction("SUPPRESS")
+
 	// TemporaryPassword
-	acui.SetTemporaryPassword(genpw())
-	
+	tmppass := genpw()
+	acui.SetTemporaryPassword(tmppass)
+
 	// UserAttributes
 	uaName := "email"
 	uaValue := email
-	ua := cidp.AttributeType {
-		Name: &uaName,
+	ua := cidp.AttributeType{
+		Name:  &uaName,
 		Value: &uaValue,
 	}
-	acui.SetUserAttributes( []*cidp.AttributeType{ &ua } )
-	
+	acui.SetUserAttributes([]*cidp.AttributeType{&ua})
+
 	// UserPoolId
-	acui.SetUserPoolId( os.Getenv("POOL") )
-	
+	acui.SetUserPoolId(pool)
+
 	// Username
 	acui.SetUsername(username)
-	
+
 	out, err := svc.AdminCreateUser(&acui)
-	if err != nil {
-		return out, err
-	}
-	
+
 	log.Debugf("addUser_end")
-	
+
+	return out, tmppass, err
+}
+
+func genHash(username string) string {
+
+	log.Debugf("genHash_begin")
+
+	hash := hmac.New(sha256.New, []byte(secret))
+	hash.Write([]byte(username + client))
+	secretHash := base64.StdEncoding.EncodeToString(hash.Sum(nil))
+
+	log.Debugf("genHash_end")
+
+	return secretHash
+}
+
+func initAuth(svc *cidp.CognitoIdentityProvider, username string, tmppass string) (*cidp.AdminInitiateAuthOutput, error) {
+
+	log.Debugf("initAuth_begin")
+
+	var aiai cidp.AdminInitiateAuthInput
+
+	aiai.SetAuthFlow("ADMIN_NO_SRP_AUTH")
+
+	aiai.SetClientId(client)
+
+	secretHash := genHash(username)
+
+	authParams := map[string]*string{
+		"USERNAME":    &username,
+		"PASSWORD":    &tmppass,
+		"SECRET_HASH": &secretHash,
+	}
+	aiai.SetAuthParameters(authParams)
+	aiai.SetUserPoolId(pool)
+
+	out, err := svc.AdminInitiateAuth(&aiai)
+
+	log.Debugf("initAuth_end")
+
 	return out, err
 }
 
-func main(){
-	
+func setPw(svc *cidp.CognitoIdentityProvider, session string, username string, password string) (*cidp.AdminRespondToAuthChallengeOutput, error) {
+
+	log.Debugf("setPw_begin")
+
+	var artaci cidp.AdminRespondToAuthChallengeInput
+
+	artaci.SetChallengeName("NEW_PASSWORD_REQUIRED")
+
+	secretHash := genHash(username)
+
+	responseParams := map[string]*string{
+		"USERNAME":     &username,
+		"NEW_PASSWORD": &password,
+		"SECRET_HASH":  &secretHash,
+	}
+	artaci.SetChallengeResponses(responseParams)
+	artaci.SetClientId(client)
+	artaci.SetSession(session)
+	artaci.SetUserPoolId(pool)
+
+	out, err := svc.AdminRespondToAuthChallenge(&artaci)
+
+	log.Debugf("setPw_end")
+
+	return out, err
+}
+
+func main() {
+
 	if os.Getenv("DEBUG") == "1" {
 		log.SetLevel(log.DebugLevel)
 	} else {
 		log.SetLevel(log.WarnLevel)
 	}
-	
+
 	log.Debugf("main_start")
-	
-	if len(os.Args) < 3 || len(os.Args) > 3 {
-		log.Errorf("%s [email] [username]", os.Args[0])
+
+	if len(os.Args) < 5 || len(os.Args) > 5 {
+		log.Errorf("%s [action] [arg01] [arg02] ...", os.Args[0])
+		log.Errorf("%s  create  [email] [username] [password]", os.Args[0])
 		os.Exit(1)
 	}
-	
+
 	mySession := session.Must(session.NewSession())
 	svc := cidp.New(mySession)
-	
-	out, err := addUser(svc, os.Args[1], os.Args[2])
-	if err != nil {
-		log.Errorf("%+v", err)
+
+	switch os.Args[1] {
+	case "create":
+		auOut, tmppass, err := addUser(svc, os.Args[2], os.Args[3])
+		if err != nil {
+			log.Errorf("%+v", err)
+			os.Exit(1)
+		}
+		log.Debugf("addUser out:\n%+v", auOut)
+		iaOut, err := initAuth(svc, os.Args[3], tmppass)
+		if err != nil {
+			log.Errorf("%+v", err)
+			os.Exit(1)
+		}
+		log.Debugf("initAuth out:\n%+v", iaOut)
+
+		spOut, err := setPw(svc, *iaOut.Session, os.Args[3], os.Args[4])
+		if err != nil {
+			log.Errorf("%+v", err)
+			os.Exit(1)
+		}
+		log.Debugf("initAuth out:\n%+v", spOut)
+	default:
+		log.Errorf("invalid action '%s'", os.Args[1])
+
 	}
-	
-	log.Debugf("addUser out:\n%+v", out)
-	
+
 }
