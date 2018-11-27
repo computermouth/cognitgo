@@ -179,6 +179,24 @@ func setPw(svc *cidp.CognitoIdentityProvider, session string, username string, p
 	return out, err
 }
 
+func sendEmail(svc *cidp.CognitoIdentityProvider, username string) (*cidp.ResendConfirmationCodeOutput, error) {
+	
+	log.Debugf("sendEmail_begin")
+	
+	var rcci cidp.ResendConfirmationCodeInput
+	
+	rcci.SetClientId(client)
+	rcci.SetSecretHash(genHash(username))
+	rcci.SetUsername(username)
+	
+	out, err := svc.ResendConfirmationCode(&rcci)
+	
+	log.Debugf("sendEmail_end")
+	
+	return out, err
+	
+}
+
 func main() {
 
 	if os.Getenv("DEBUG") == "1" {
@@ -206,6 +224,7 @@ func main() {
 			os.Exit(1)
 		}
 		log.Debugf("addUser out:\n%+v", auOut)
+		
 		iaOut, err := initAuth(svc, os.Args[3], tmppass)
 		if err != nil {
 			log.Errorf("%+v", err)
@@ -219,6 +238,13 @@ func main() {
 			os.Exit(1)
 		}
 		log.Debugf("initAuth out:\n%+v", spOut)
+
+		seOut, err := sendEmail(svc, os.Args[3])
+		if err != nil {
+			log.Errorf("%+v", err)
+			os.Exit(1)
+		}
+		log.Debugf("initAuth out:\n%+v", seOut)
 	default:
 		log.Errorf("invalid action '%s'", os.Args[1])
 
